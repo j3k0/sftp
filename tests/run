@@ -1,0 +1,419 @@
+#!/bin/bash
+# See: https://github.com/kward/shunit2
+# Usage: tests/run [OPTION]... IMAGE_NAME
+# Options: --verbose --no-cleanup
+# Example: tests/run atmoz/sftp:alpine
+
+# Booleans
+OPTION_TRUE=0
+OPTION_FALSE=1
+
+# Options
+OPTION_VERBOSE="${OPTION_VERBOSE:-"$OPTION_FALSE"}"
+OPTION_CLEANUP="${OPTION_CLEANUP:-"$OPTION_TRUE"}"
+
+# ARGUMENTS:
+while [ "$#" -ge 1 ]; do
+    case "$1" in
+        --verbose) OPTION_VERBOSE="$OPTION_TRUE"; shift ;;
+        --no-cleanup) OPTION_VERBOSE="$OPTION_FALSE"; shift ;;
+        --) break ;; # rest of arguments goes to shunit2
+        --*) echo "Unknown argument: $1"; exit 2 ;;
+        *) imageName="$1"; shift ;;
+    esac
+done
+
+testDir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+tmpDir="$(mktemp -d /tmp/atmoz_sftp_XXXX)"
+sshKeyPri="$tmpDir/rsa"
+sshKeyPub="$tmpDir/rsa.pub"
+sshHostEd25519Key="$tmpDir/ssh_host_ed25519_key"
+sshHostKeyMountArg="--volume=$sshHostEd25519Key:/etc/ssh/ssh_host_ed25519_key"
+sshKnownHosts="$tmpDir/known_hosts"
+runArgs=("-P" "--network=private" "$sshHostKeyMountArg")
+
+# podman or docker
+if [ -z "$CONTAINER_ENGINE" ]; then
+    if type podman &>/dev/null; then
+        CONTAINER_ENGINE="podman"
+    else
+        CONTAINER_ENGINE="docker"
+    fi
+fi
+
+if [ ! -f "$testDir/shunit2/shunit2" ]; then
+    echo "Could not find shunit2 in $testDir/shunit2"
+    echo "Run 'git submodule update --init'"
+    exit 2
+fi
+
+if [ -z "$imageName" ]; then
+    echo "Missing name of image you want to run tests against"
+    exit 3
+fi
+
+if [ "$OPTION_VERBOSE" == "$OPTION_TRUE" ]; then
+    redirect="/dev/stdout"
+else
+    redirect="/dev/null"
+fi
+
+##############################################################################
+## Setup: shunit2 functions
+##############################################################################
+
+function oneTimeSetUp() {
+    # Generate temporary ssh keys for testing
+    if [ ! -f "$sshKeyPri" ]; then
+        ssh-keygen -t rsa -f "$sshKeyPri" -N '' < /dev/null > "$redirect" 2>&1
+    fi
+
+    # Private key can not be read by others (sshd will complain)
+    chmod go-rw "$sshKeyPri"
+
+    # Generate host key
+    ssh-keygen -t ed25519 -f "$sshHostEd25519Key" -N '' < /dev/null
+}
+
+function setUp() {
+    # shellcheck disable=SC2154
+    containerName="atmoz_sftp_${_shunit_test_}"
+    containerTmpDir="$(mktemp -d "/tmp/${containerName}_XXXX")"
+    export containerName containerTmpDir
+
+    retireContainer "$containerName" # clean up leftover container
+}
+
+function tearDown() {
+    retireContainer "$containerName"
+
+    if [ "$OPTION_CLEANUP" == "$OPTION_TRUE" ] && [ -d "$containerTmpDir" ]; then
+        rm -rf "$containerTmpDir" || true # Can fail on GitHub Actions
+    fi
+}
+
+##############################################################################
+## Helper functions
+##############################################################################
+
+function container() {
+    "$CONTAINER_ENGINE" "$@"
+}
+function retireContainer() {
+    if [ "$(container ps -qaf name="$1")" ]; then
+        if [ "$OPTION_VERBOSE" == "$OPTION_TRUE" ]; then
+            echo "container log for $1:"
+            container logs "$1"
+        fi
+
+        if [ "$OPTION_CLEANUP" == "$OPTION_TRUE" ]; then
+            container rm -fv "$1" > "$redirect" 2>&1
+        fi
+    fi
+}
+
+function getSftpPort() {
+    container container port "$1" | cut -d: -f2 | head -1
+}
+
+function runSftpCommands() {
+    port="$(getSftpPort "$1")"
+    user="$2"
+    shift 2
+
+    echo "127.0.0.1 $(cat "$sshHostEd25519Key.pub")" >> "$sshKnownHosts"
+
+    commands=""
+    for cmd in "$@"; do
+        commands="$commands$cmd"$'\n'
+    done
+
+    echo "$commands" | sftp \
+        -i "$sshKeyPri" \
+        -oUserKnownHostsFile="$sshKnownHosts" \
+        -b - -P "$port" "$user@127.0.0.1" \
+        > "$redirect" 2>&1
+
+    status=$?
+    sleep 1 # wait for commands to finish
+    return $status
+}
+
+function waitForServer() {
+    local containerName="$1"
+    local port
+
+    echo -n "Waiting for $containerName to open a port ..."
+
+    for _ in {1..30}; do
+        echo -n "."
+        port="$(getSftpPort "$containerName")"
+        if [ -n "$port" ] && ssh-keyscan -4 -T 1 -p "$port" "127.0.0.1" &>/dev/null; then
+            echo " PORT $port OPEN"
+            return 0;
+        fi
+        sleep 0.5
+    done
+
+    echo " TIMEOUT"
+    return 1
+}
+
+##############################################################################
+## Tests
+##############################################################################
+
+function testSmallestUserConfig() {
+    container run --name "$containerName" "${runArgs[@]}" \
+        --entrypoint="/bin/sh" \
+        "$imageName" \
+        -c "create-sftp-user u: && id u" \
+        > "$redirect" 2>&1
+    assertTrue "user created" $?
+}
+
+function testCreateUserWithDot() {
+    container run --name "$containerName" "${runArgs[@]}" \
+        --entrypoint="/bin/sh" \
+        "$imageName" \
+        -c "create-sftp-user user.with.dot: && id user.with.dot" \
+        > "$redirect" 2>&1
+    assertTrue "user created" $?
+}
+
+function testUserCustomUidAndGid() {
+    id="$(container run --name "$containerName" "${runArgs[@]}" \
+        --entrypoint="/bin/sh" \
+        "$imageName" \
+        -c "create-sftp-user u::1234:4321: > /dev/null && id u" )"
+
+    echo "$id" | grep -q 'uid=1234('
+    assertTrue "custom UID" $?
+
+    echo "$id" | grep -q 'gid=4321('
+    assertTrue "custom GID" $?
+
+    # Here we also check group name
+    assertEquals "uid=1234(u) gid=4321(group_4321) groups=4321(group_4321)" "$id"
+}
+
+function testCommandPassthrough() {
+    container run --name "$containerName" "${runArgs[@]}" \
+        "$imageName" test 1 -eq 1 \
+        > "$redirect" 2>&1
+    assertTrue "command passthrough" $?
+}
+
+function testUsersConf() {
+    container run --name "$containerName" "${runArgs[@]}" -d \
+        -v "$testDir/files/users.conf:/etc/sftp/users.conf:ro" \
+        "$imageName" \
+        > "$redirect" 2>&1
+
+    waitForServer "$containerName"
+    assertTrue "waitForServer" $?
+
+    container exec "$containerName" id user-from-conf > /dev/null
+    assertTrue "user-from-conf" $?
+
+    container exec "$containerName" id test > /dev/null
+    assertTrue "test" $?
+
+    container exec "$containerName" id user.with.dot > /dev/null
+    assertTrue "user.with.dot" $?
+
+    container exec "$containerName" test -d /home/test/dir1 -a -d /home/test/dir2
+    assertTrue "dirs exists" $?
+}
+
+function testLegacyUsersConf() {
+    container run --name "$containerName" "${runArgs[@]}" -d \
+        -v "$testDir/files/users.conf:/etc/sftp-users.conf:ro" \
+        "$imageName" \
+        > "$redirect" 2>&1
+
+    waitForServer "$containerName"
+    assertTrue "waitForServer" $?
+
+    container exec "$containerName" id user-from-conf > /dev/null
+    assertTrue "user-from-conf" $?
+}
+
+function testCreateUsersUsingEnv() {
+    container run --name "$containerName" "${runArgs[@]}" -d \
+        -e "SFTP_USERS=user-from-env: user-from-env-2:" \
+        "$imageName" \
+        > "$redirect" 2>&1
+
+    waitForServer "$containerName"
+    assertTrue "waitForServer" $?
+
+    container exec "$containerName" id user-from-env > /dev/null
+    assertTrue "user-from-env" $?
+
+    container exec "$containerName" id user-from-env-2 > /dev/null
+    assertTrue "user-from-env-2" $?
+}
+
+function testCreateUsersUsingCombo() {
+    container run --name "$containerName" "${runArgs[@]}" -d \
+        -v "$testDir/files/users.conf:/etc/sftp-users.conf:ro" \
+        -e "SFTP_USERS=user-from-env:" \
+        "$imageName" \
+        user-from-cmd: \
+        > "$redirect" 2>&1
+
+    waitForServer "$containerName"
+    assertTrue "waitForServer" $?
+
+    container exec "$containerName" id user-from-conf > /dev/null
+    assertTrue "user-from-conf" $?
+
+    container exec "$containerName" id user-from-env > /dev/null
+    assertTrue "user-from-env" $?
+
+    container exec "$containerName" id user-from-cmd > /dev/null
+    assertTrue "user-from-cmd" $?
+}
+
+function testWriteAccessToAutocreatedDirs() {
+    container run --name "$containerName" "${runArgs[@]}" -d \
+        -v "$sshKeyPub":/home/test/.ssh/keys/id_rsa.pub:ro \
+        "$imageName" "test::::testdir,dir with spaces" \
+        > "$redirect" 2>&1
+
+    waitForServer "$containerName"
+    assertTrue "waitForServer" $?
+
+    runSftpCommands "$containerName" "test" \
+        "cd testdir" \
+        "mkdir test" \
+        "cd '../dir with spaces'" \
+        "mkdir test" \
+        "exit"
+    assertTrue "runSftpCommands" $?
+
+    container exec "$containerName" test -d /home/test/testdir/test
+    assertTrue "testdir write access" $?
+
+    container exec "$containerName" test -d "/home/test/dir with spaces/test"
+    assertTrue "dir with spaces write access" $?
+}
+
+# j3k0 fork: absolute path as last field = custom (existing) home directory
+function testCustomHomeDir() {
+    mkdir -p "$containerTmpDir/html"
+    chmod 777 "$containerTmpDir/html" # writable by uid 33
+
+    container run --name "$containerName" "${runArgs[@]}" -d \
+        -v "$sshKeyPub":/var/www/.ssh/keys/id_rsa.pub:ro \
+        -v "$containerTmpDir/html":/var/www/html \
+        "$imageName" "test::33::/var/www" \
+        > "$redirect" 2>&1
+
+    waitForServer "$containerName"
+    assertTrue "waitForServer" $?
+
+    runSftpCommands "$containerName" "test" \
+        "cd html" \
+        "mkdir test" \
+        "exit"
+    assertTrue "runSftpCommands" $?
+
+    container exec "$containerName" test -d /var/www/html/test
+    assertTrue "custom home write access" $?
+
+    container exec "$containerName" test -e /home/test
+    assertFalse "/home/test should not be created" $?
+
+    assertEquals "home dir" "/var/www" \
+        "$(container exec "$containerName" getent passwd test | cut -d: -f6)"
+}
+
+function testWriteAccessToLimitedChroot() {
+    # Modified sshd_config with chrooted home subdir
+    tmpConfig="$(mktemp)"
+    container run --rm --entrypoint=bash "$imageName" -c "cat /etc/ssh/sshd_config" |
+        sed 's/^ChrootDirectory.*/ChrootDirectory %h\/sftp/' \
+        > "$tmpConfig"
+
+    # Set correct permissions on chroot
+    tmpScript="$(mktemp)"
+    cat > "$tmpScript" <<EOF
+mkdir -p /home/*/sftp
+chown root:root /home/*/sftp
+chmod 755 /home/*/sftp
+EOF
+    chmod +x "$tmpScript"
+
+    container run --name "$containerName" "${runArgs[@]}" -d \
+        -v "$sshKeyPub":/home/test/.ssh/keys/id_rsa.pub:ro \
+        -v "$tmpConfig:/etc/ssh/sshd_config" \
+        -v "$tmpScript:/etc/sftp.d/limited_home_dir" \
+        "$imageName" "test::::sftp/upload" \
+        > "$redirect" 2>&1
+
+    waitForServer "$containerName"
+    assertTrue "waitForServer" $?
+
+    runSftpCommands "$containerName" "test" \
+        "cd upload" \
+        "mkdir test" \
+        "exit"
+    assertTrue "runSftpCommands" $?
+
+    container exec "$containerName" test -d /home/test/sftp/upload/test
+    assertTrue "limited chroot write access" $?
+}
+
+function testBindmountDirScript() {
+    mkdir -p "$containerTmpDir/custom/bindmount"
+    echo "mkdir -p /home/custom/bindmount && \
+        chown custom /custom /home/custom/bindmount && \
+        mount --bind /custom /home/custom/bindmount" \
+        > "$containerTmpDir/mount.sh"
+    chmod +x "$containerTmpDir/mount.sh"
+
+    container run --name "$containerName" "${runArgs[@]}" -d \
+        --privileged=true \
+        -v "$sshKeyPub":/home/custom/.ssh/keys/id_rsa.pub:ro \
+        -v "$containerTmpDir/custom/bindmount":/custom \
+        -v "$containerTmpDir/mount.sh":/etc/sftp.d/mount.sh \
+        "$imageName" custom:123 \
+        > "$redirect" 2>&1
+
+    waitForServer "$containerName"
+    assertTrue "waitForServer" $?
+
+    runSftpCommands "$containerName" "custom" \
+        "cd bindmount" \
+        "mkdir test" \
+        "exit"
+    assertTrue "runSftpCommands" $?
+
+    container exec "$containerName" test -d /home/custom/bindmount/test
+    assertTrue "directory exist" $?
+}
+
+function testDuplicateSshKeys() {
+    container run --name "$containerName" "${runArgs[@]}" -d \
+        -v "$sshKeyPub":/home/user/.ssh/keys/key1.pub:ro \
+        -v "$sshKeyPub":/home/user/.ssh/keys/key2.pub:ro \
+        "$imageName" "user:" \
+        > "$redirect" 2>&1
+
+    waitForServer "$containerName"
+    assertTrue "waitForServer" $?
+
+    lines="$(container exec "$containerName" sh -c \
+        "wc -l < /home/user/.ssh/authorized_keys")"
+    assertEquals "1" "$lines"
+}
+
+##############################################################################
+## Run
+##############################################################################
+
+# shellcheck disable=SC1091
+source "$testDir/shunit2/shunit2"
+# Nothing happens after this
