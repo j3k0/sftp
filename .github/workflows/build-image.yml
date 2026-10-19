@@ -111,6 +111,9 @@ jobs:
             --label="org.opencontainers.image.revision=$GITHUB_SHA" \
             --label="org.opencontainers.image.created=$(date --rfc-3339=seconds)"
 
+      - name: Create docker network for tests
+        run: docker network create private # j3k0 fork: not present on GitHub runners
+
       - name: Test image
         # j3k0 fork: pin to docker, otherwise tests/run picks podman (installed
         # on GitHub runners) which can't see images built with docker build.
