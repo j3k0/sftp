@@ -112,7 +112,9 @@ jobs:
             --label="org.opencontainers.image.created=$(date --rfc-3339=seconds)"
 
       - name: Test image
-        run: tests/run "${{ inputs.image }}:${{ inputs.tag }}"
+        # j3k0 fork: pin to docker, otherwise tests/run picks podman (installed
+        # on GitHub runners) which can't see images built with docker build.
+        run: CONTAINER_ENGINE=docker tests/run "${{ inputs.image }}:${{ inputs.tag }}"
 
       - name: Save image
         run: docker save -o "${{ inputs.tag }}.tar" "${{ inputs.image }}:${{ inputs.tag }}"
