@@ -61,8 +61,16 @@ printf '%s\n' "$SFTP_PW"
 EOF
 chmod +x "$WORK/askpass"
 # -F /dev/null + IdentityFile=none: never touch the user's ~/.ssh; BatchMode=no: sftp -b would disable passwords
-COMMON=(-F /dev/null -o BatchMode=no -o IdentityFile=none -o IdentitiesOnly=yes -P "$PORT" -o ConnectTimeout=10 -o PreferredAuthentications=password,keyboard-interactive
-        -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 -o LogLevel=ERROR)
+COMMON=(-F /dev/null
+        -o BatchMode=no
+        -o IdentityFile=none
+        -o IdentitiesOnly=yes
+        -P "$PORT"
+        -o ConnectTimeout=10
+        "-o PreferredAuthentications=password,keyboard-interactive"
+        -o PubkeyAuthentication=no
+        -o NumberOfPasswordPrompts=1
+        -o LogLevel=ERROR)
 # run_sftp PASSWORD BATCHFILE [extra ssh opts...]
 run_sftp() {
   local pw=$1 batch=$2; shift 2
@@ -94,7 +102,7 @@ for t in rsa ecdsa ed25519 dsa; do
   echo "$line" | cut -d' ' -f2- > "$WORK/scan_$t.pub"
   echo "$line" > "$WORK/kh_$t"
   got=$(fp "$WORK/scan_$t.pub"); want=$(fp "$pubf")
-  if [ "$got" = "$want" ]; then pass b.keyscan.$t "$got (via $via)"; OFFERED+=($t)
+  if [ "$got" = "$want" ]; then pass b.keyscan.$t "$got (via $via)"; OFFERED+=("$t")
   else fail b.keyscan.$t "fingerprint mismatch got=$got want=$want"; fi
 done
 info b.offered "${OFFERED[*]:-none}"
@@ -113,10 +121,14 @@ EOF
 out=$(run_sftp "$PASS" "$WORK/batch_c" "${NOPIN[@]}"); rc=$?
 echo "$out" > "$WORK/out_c"
 if [ $rc -eq 0 ]; then pass c.login+batch; else fail c.login+batch "rc=$rc: $(echo "$out" | tr '\n' '|' | head -c 600)"; fi
-grep -q 'Remote working directory: /$' "$WORK/out_c" && pass c.pwd "/" || fail c.pwd "$(grep -i 'working dir' "$WORK/out_c")"
-awk '/^sftp> ls$/{f=1;next} /^sftp>/{f=0} f' "$WORK/out_c" | grep -qw html && pass c.ls "html visible" || fail c.ls "html not listed"
-cmp -s "$WORK/up.txt" "$WORK/down.txt" && pass c.get-roundtrip || fail c.get-roundtrip "content differs/missing"
-grep -q 'moved.txt' "$WORK/out_c" && pass c.rename || fail c.rename
+if grep -q 'Remote working directory: /$' "$WORK/out_c"; then pass c.pwd "/"
+else fail c.pwd "$(grep -i 'working dir' "$WORK/out_c")"; fi
+if awk '/^sftp> ls$/{f=1;next} /^sftp>/{f=0} f' "$WORK/out_c" | grep -qw html; then pass c.ls "html visible"
+else fail c.ls "html not listed"; fi
+if cmp -s "$WORK/up.txt" "$WORK/down.txt"; then pass c.get-roundtrip
+else fail c.get-roundtrip "content differs/missing"; fi
+if grep -q 'moved.txt' "$WORK/out_c"; then pass c.rename
+else fail c.rename; fi
 
 # ---- d. ownership on host volume ----
 f=$HTML/sub/moved.txt
@@ -126,7 +138,9 @@ if [ -e "$f" ]; then
 else fail d.file-owner "uploaded file not found on host volume"; fi
 
 printf 'rm html/sub/moved.txt\nrmdir html/sub\n' > "$WORK/batch_rm"
-out=$(run_sftp "$PASS" "$WORK/batch_rm" "${NOPIN[@]}") && [ ! -e "$f" ] && pass c.rm || fail c.rm "$(echo "$out" | tr '\n' '|')"
+out=$(run_sftp "$PASS" "$WORK/batch_rm" "${NOPIN[@]}"); rc=$?
+if [ $rc -eq 0 ] && [ ! -e "$f" ]; then pass c.rm
+else fail c.rm "rc=$rc: $(echo "$out" | tr '\n' '|')"; fi
 
 # ---- e. chroot root not writable ----
 printf 'put %s /root-write.txt\n' "$WORK/up.txt" > "$WORK/batch_e"
@@ -153,12 +167,17 @@ echo bye >&9; exec 9>&-; wait 2>/dev/null
 # ---- g. restart ----
 docker restart -t 5 "$NAME" >/dev/null
 sleep 3; wait_port
-out=$(run_sftp "$PASS" "$WORK/batch_pwd" "${NOPIN[@]}") && pass g.login-after-restart || fail g.login-after-restart "$(echo "$out" | tr '\n' '|' | head -c 400)"
+out=$(run_sftp "$PASS" "$WORK/batch_pwd" "${NOPIN[@]}"); rc=$?
+if [ $rc -eq 0 ]; then pass g.login-after-restart
+else fail g.login-after-restart "rc=$rc: $(echo "$out" | tr '\n' '|' | head -c 400)"; fi
 info g.logs-after-restart "$(docker logs --since 20s "$NAME" 2>&1 | tr '\n' '|' | head -c 800)"
 
 # ---- h. pinned known_hosts, one key type at a time ----
 for t in ecdsa ed25519 rsa dsa; do
-  [ -f "$WORK/kh_$t" ] || { [ $t = dsa ] && info h.pinned.$t "no scanned key, skipped" || fail h.pinned.$t "no scanned key"; continue; }
+  if [ ! -f "$WORK/kh_$t" ]; then
+    if [ "$t" = dsa ]; then info h.pinned.$t "no scanned key, skipped"; else fail h.pinned.$t "no scanned key"; fi
+    continue
+  fi
   PIN=(-o StrictHostKeyChecking=yes -o UserKnownHostsFile="$WORK/kh_$t")
   out=$(run_sftp "$PASS" "$WORK/batch_pwd" "${PIN[@]}"); rc=$?
   if [ $rc -eq 0 ]; then pass h.pinned.$t "default client algorithms"
