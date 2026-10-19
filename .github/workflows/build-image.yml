@@ -34,27 +34,42 @@ jobs:
 
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login docker.pkg.github.com \
             -u ${{ github.actor }} --password-stdin
-          docker pull "$latest_tag"
+          # j3k0 fork: allow first build when no image was ever published
+          docker pull "$latest_tag" \
+            || echo "no_previous_image=true" >> "$GITHUB_ENV"
           docker logout docker.pkg.github.com
 
       - name: Check if git revision has changed
         id: revision
         run: |
-          revision="$(docker image inspect --format \
-            '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
-            "$latest_tag")"
-          echo "$revision"
-          if [ "$revision" != "$GITHUB_SHA" ]; then
-            echo "Latest image revision ($revision) is not the same as current revision ($GITHUB_SHA)"
+          if [ -n "$no_previous_image" ]; then
+            echo "No previously published image found; will build"
             echo "changed_revision=true" >> result
+          elif docker image inspect --format \
+            '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+            "$latest_tag" > revision; then
+            revision=$(cat revision)
+            echo "$revision"
+            if [ "$revision" != "$GITHUB_SHA" ]; then
+              echo "Latest image revision ($revision) is not the same as current revision ($GITHUB_SHA)"
+              echo "changed_revision=true" >> result
+            else
+              echo "Latest image revision is the same as current revision ($GITHUB_SHA)"
+              echo "changed_revision=false" >> result
+            fi
           else
-            echo "Latest image revision is the same as current revision ($GITHUB_SHA)"
-            echo "changed_revision=false" >> result
+            echo "Failed to inspect $latest_tag; will build"
+            echo "changed_revision=true" >> result
           fi
 
       - name: Check for new updates
         id: updates
         run: |
+          if [ -n "$no_previous_image" ]; then
+            echo "No previously published image; skipping update check"
+            echo "new_updates=false" >> result
+            exit 0
+          fi
           packages="$(docker run --rm --entrypoint=/bin/sh "$latest_tag" -c "${{ inputs.update-check }}")"
           echo "$packages"
           if [ "${#packages}" -gt 0 ]; then
@@ -135,9 +150,13 @@ jobs:
           docker logout docker.pkg.github.com
 
       - name: Push images to Docker Hub registry
+        if: env.DOCKER_HUB_PASSWORD != '' # j3k0 fork: no Docker Hub secrets here
+        env:
+          DOCKER_HUB_PASSWORD: ${{ secrets.DOCKER_HUB_PASSWORD }}
+          DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
         run: |
-          echo "${{ secrets.DOCKER_HUB_PASSWORD }}" | docker login \
-            -u ${{ secrets.DOCKER_HUB_USERNAME }} --password-stdin
+          echo "$DOCKER_HUB_PASSWORD" | docker login \
+            -u "$DOCKER_HUB_USERNAME" --password-stdin
 
           docker push "${{ inputs.image }}:${{ inputs.tag }}"
           docker logout
