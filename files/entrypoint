@@ -2,7 +2,8 @@
 set -Eeo pipefail
 
 # shellcheck disable=2154
-trap 's=$?; echo "$0: Error on line "$LINENO": $BASH_COMMAND"; exit $s' ERR
+# j3k0 fork: never print $BASH_COMMAND, it can contain the password (WPH-45)
+trap 's=$?; echo "$0: Error on line $LINENO (exit $s)"; exit $s' ERR
 
 reArgsMaybe="^[^:[:space:]]+:.*$" # Smallest indication of attempt to use argument
 reArgSkip='^([[:blank:]]*#.*|[[:blank:]]*)$' # comment or empty line
@@ -32,6 +33,10 @@ fi
 # Create users only on first run
 if [ ! -f "$userConfFinalPath" ]; then
     mkdir -p "$(dirname $userConfFinalPath)"
+    # j3k0 fork: this file holds the passwords while users are created; keep
+    # it root-only and strip the passwords afterwards (WPH-45)
+    (umask 077 && : > "$userConfFinalPath")
+    chmod 600 "$userConfFinalPath"
 
     if [ -f "$userConfPath" ]; then
         # Append mounted config to final config
@@ -56,11 +61,23 @@ if [ ! -f "$userConfFinalPath" ]; then
     # Check that we have users in config
     if [ -f "$userConfFinalPath" ] && [ "$(wc -l < "$userConfFinalPath")" -gt 0 ]; then
         # Import users from final conf file
+        createFailed=false
         while IFS= read -r user || [[ -n "$user" ]]; do
-            create-sftp-user "$user"
+            create-sftp-user "$user" || { createFailed=true; break; }
         done < "$userConfFinalPath"
+        # j3k0 fork: on failure remove the file (it still holds the
+        # passwords) so that the next start retries user creation
+        if $createFailed; then
+            rm -f "$userConfFinalPath"
+            exit 1
+        fi
+        # j3k0 fork: keep only the user names. The file is only used as the
+        # "users already created" marker on later starts (WPH-45).
+        (umask 077 && cut -d: -f1 "$userConfFinalPath" > "$userConfFinalPath.tmp")
+        mv -f "$userConfFinalPath.tmp" "$userConfFinalPath"
     elif $startSshd; then
         log "FATAL: No users provided!"
+        rm -f "$userConfFinalPath"
         exit 3
     fi
 
