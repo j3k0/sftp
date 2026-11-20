@@ -100,7 +100,11 @@ for t in rsa ecdsa ed25519 dsa; do
   if [ -z "$line" ]; then   # local client may not speak this alg (e.g. dsa): try old client
     line=$(helper "ssh-keyscan -T 5 -t $t -p $PORT 127.0.0.1 2>/dev/null" | grep -v '^#' | head -1); via=$HELPER
   fi
-  if [ -z "$line" ]; then fail b.keyscan.$t "not offered (tried local + $HELPER)"; continue; fi
+  if [ -z "$line" ]; then
+    # OpenSSH >= 9.x no longer serves DSA host keys: known, accepted difference
+    if [ "$t" = dsa ]; then info b.keyscan.dsa "not offered (expected for OpenSSH >= 9)"; else fail b.keyscan.$t "not offered (tried local + $HELPER)"; fi
+    continue
+  fi
   echo "$line" | cut -d' ' -f2- > "$WORK/scan_$t.pub"
   echo "$line" > "$WORK/kh_$t"
   got=$(fp "$WORK/scan_$t.pub"); want=$(fp "$pubf")
