@@ -61,11 +61,16 @@ if [ ! -f "$userConfFinalPath" ]; then
     # Check that we have users in config
     if [ -f "$userConfFinalPath" ] && [ "$(wc -l < "$userConfFinalPath")" -gt 0 ]; then
         # Import users from final conf file
+        createFailed=false
         while IFS= read -r user || [[ -n "$user" ]]; do
-            # j3k0 fork: on failure remove the file (it still holds the
-            # passwords) so that the next start retries user creation
-            create-sftp-user "$user" || { rm -f "$userConfFinalPath"; exit 1; }
+            create-sftp-user "$user" || { createFailed=true; break; }
         done < "$userConfFinalPath"
+        # j3k0 fork: on failure remove the file (it still holds the
+        # passwords) so that the next start retries user creation
+        if $createFailed; then
+            rm -f "$userConfFinalPath"
+            exit 1
+        fi
         # j3k0 fork: keep only the user names. The file is only used as the
         # "users already created" marker on later starts (WPH-45).
         (umask 077 && cut -d: -f1 "$userConfFinalPath" > "$userConfFinalPath.tmp")

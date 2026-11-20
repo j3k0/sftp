@@ -17,7 +17,7 @@
 set -u
 IMAGE=${1:?usage: concurrency.sh IMAGE [PORT]}
 PORT=${2:-$(( 20000 + RANDOM % 20000 ))}
-USER_=admin
+USER_="admin"
 PASS=$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)
 NAME=sftp-conc-$$
 WORK=$(mktemp -d /tmp/sftp-conc.XXXX)
