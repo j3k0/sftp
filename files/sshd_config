@@ -7,6 +7,12 @@ HostKey /etc/ssh/ssh_host_rsa_key
 # that pinned it in known_hosts keep working.
 HostKey /etc/ssh/ssh_host_ecdsa_key
 
+# j3k0 fork (WPH-45): free unauthenticated slots sooner (default 120 s). Kept
+# above 20 s so that people typing a password at an interactive prompt are
+# not cut off. MaxAuthTries is left at its default (6): clients with several
+# keys in an agent would otherwise fail before reaching password auth.
+LoginGraceTime 30
+
 # Faster connection
 # See: https://github.com/atmoz/sftp/issues/11
 UseDNS no

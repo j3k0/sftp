@@ -24,7 +24,7 @@ helper() { docker run --rm --network host -v "$KEYS:/k" -v "$WORK:/w" "$HELPER" 
   "command -v ssh-keygen >/dev/null || { apt-get -qq update && apt-get -qq install -y openssh-client >/dev/null 2>&1; }; $1"; }
 
 cleanup() {
-  docker rm -f "$NAME" >/dev/null 2>&1
+  docker rm -f "$NAME" "$NAME-e" "$NAME-m" >/dev/null 2>&1
   # volume files may be owned by uid 33: remove from inside a container
   docker run --rm -v "$WORK:/w" "$HELPER" rm -rf /w/html >/dev/null 2>&1
   rm -rf "$WORK"
@@ -84,7 +84,8 @@ wait_port() { for _ in $(seq 1 30); do ssh-keyscan -T 2 -p "$PORT" 127.0.0.1 2>/
 sleep 3
 if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" = true ]; then pass a.running
 else fail a.running "state=$(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' "$NAME" 2>&1)"; fi
-info a.logs "$(docker logs "$NAME" 2>&1 | tr '\n' '|' | head -c 1500)"
+mask() { sed "s/$PASS/<PASS>/g"; }   # results never contain the test password
+info a.logs "$(docker logs "$NAME" 2>&1 | mask | tr '\n' '|' | head -c 1500)"
 wait_port || fail a.port "port $PORT never answered"
 
 # ---- b. host key scan ----
@@ -170,7 +171,7 @@ sleep 3; wait_port
 out=$(run_sftp "$PASS" "$WORK/batch_pwd" "${NOPIN[@]}"); rc=$?
 if [ $rc -eq 0 ]; then pass g.login-after-restart
 else fail g.login-after-restart "rc=$rc: $(echo "$out" | tr '\n' '|' | head -c 400)"; fi
-info g.logs-after-restart "$(docker logs --since 20s "$NAME" 2>&1 | tr '\n' '|' | head -c 800)"
+info g.logs-after-restart "$(docker logs --since 20s "$NAME" 2>&1 | mask | tr '\n' '|' | head -c 800)"
 
 # ---- h. pinned known_hosts, one key type at a time ----
 for t in ecdsa ed25519 rsa dsa; do
@@ -196,6 +197,52 @@ for t in ecdsa ed25519 rsa dsa; do
   fi
 done
 
-info sshd-version "$(docker exec "$NAME" sh -c 'ssh -V 2>&1; grep PRETTY /etc/os-release' 2>&1 | tr '\n' ' ')"
+# ---- j. password hash scheme (prints a fixed word only) ----
+hash_kind() { docker exec -i "$1" sh -s <<'EOS'
+awk -F: '$1=="admin"{p=substr($2,1,3); if(p=="$6$")print "sha512"; else if(p=="$y$")print "yescrypt"; else print "other"}' /etc/shadow
+EOS
+}
+k=$(hash_kind "$NAME")
+if [ "$k" = sha512 ]; then pass j.hash-sha512; else fail j.hash-sha512 "admin hash is '$k'"; fi
+
+# ---- k. no copy of the password in logs or in the container filesystem ----
+n=$(docker logs "$NAME" 2>&1 | grep -cF "$PASS")
+if [ "$n" = 0 ]; then pass k.no-password-in-logs; else fail k.no-password-in-logs "$n line(s)"; fi
+n=$(docker export "$NAME" | grep -caF "$PASS")
+if [ "$n" = 0 ]; then pass k.no-password-in-filesystem "docker export, count only"
+else fail k.no-password-in-filesystem "$n match(es) in docker export"; fi
+m=$(docker exec "$NAME" stat -c '%a %U' /var/run/sftp/users.conf 2>&1)
+if [ "$m" = "600 root" ]; then pass k.users.conf-mode "$m"; else fail k.users.conf-mode "$m"; fi
+
+# ---- l. pre-hashed (:e) password path ----
+HASH=$(printf '%s' "$PASS" | openssl passwd -6 -stdin)
+NAME_E=$NAME-e PORT_E=$((PORT + 1))
+docker run -d --name "$NAME_E" -v "$HTML:/var/www/html" -p "127.0.0.1:$PORT_E:22" \
+  --memory 64m --memory-swap 64m "$IMAGE" "$USER_:$HASH:e:33::/var/www" >/dev/null
+sleep 4
+if [ "$(docker inspect -f '{{.State.Running}}/{{.RestartCount}}' "$NAME_E" 2>/dev/null)" = true/0 ]; then pass l.e-path-running
+else fail l.e-path-running "$(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' "$NAME_E" 2>&1)"; fi
+P0=$PORT; PORT=$PORT_E; COMMON[9]=$PORT_E   # -P value
+wait_port
+out=$(run_sftp "$PASS" "$WORK/batch_pwd" "${NOPIN[@]}"); rc=$?
+PORT=$P0; COMMON[9]=$P0
+if [ $rc -eq 0 ]; then pass l.e-path-login; else fail l.e-path-login "rc=$rc: $(echo "$out" | mask | tr '\n' '|' | head -c 300)"; fi
+k=$(hash_kind "$NAME_E"); if [ "$k" = sha512 ]; then pass l.e-path-hash-kept; else fail l.e-path-hash-kept "'$k'"; fi
+docker rm -f "$NAME_E" >/dev/null 2>&1
+
+# ---- m. rejected / malformed user strings never print the password ----
+for spec in "$USER_:$PASS:x::/var/www" "$USER_:$PASS:33::/var/www,/x" "$USER_:$(printf 'Z%.0s' $(seq 1 250))$PASS:33::/var/www"; do
+  NAME_M=$NAME-m
+  docker run -d --name "$NAME_M" "$IMAGE" "$spec" >/dev/null 2>&1
+  sleep 3
+  st=$(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' "$NAME_M" 2>&1)
+  n=$(docker logs "$NAME_M" 2>&1 | grep -cF "$PASS")
+  n2=$(docker export "$NAME_M" 2>/dev/null | grep -caF "$PASS")
+  if [ "$n" = 0 ] && [ "$n2" = 0 ]; then pass m.rejected-no-leak "${spec%%:*}:<...> -> $st, logs 0, fs 0"
+  else fail m.rejected-no-leak "${spec%%:*}:<...> -> $st, logs $n, fs $n2"; fi
+  docker rm -f "$NAME_M" >/dev/null 2>&1
+done
+
+info sshd-version "$(docker exec "$NAME" sh -c 'ssh -V 2>&1; grep PRETTY /etc/os-release; dpkg-query -W -f="openssh-server \${Version}" openssh-server 2>/dev/null' 2>&1 | tr '\n' ' ')"
 log "SUMMARY $IMAGE: $NPASS passed, $NFAIL failed (results: $RES)"
 [ $NFAIL -eq 0 ]

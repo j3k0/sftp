@@ -2,7 +2,8 @@
 set -Eeo pipefail
 
 # shellcheck disable=2154
-trap 's=$?; echo "$0: Error on line "$LINENO": $BASH_COMMAND"; exit $s' ERR
+# j3k0 fork: never print $BASH_COMMAND, it can contain the password (WPH-45)
+trap 's=$?; echo "$0: Error on line $LINENO (exit $s)"; exit $s' ERR
 
 # Extended regular expression (ERE) for arguments
 reUser='[A-Za-z0-9._][A-Za-z0-9._-]{0,31}' # POSIX.1-2008
@@ -23,24 +24,33 @@ function validateArg() {
 
     if [[ "$val" =~ ^$re$ ]]; then
         return 0
+    elif [ "$name" == "password" ]; then
+        # j3k0 fork: never print the password value (WPH-45)
+        log "ERROR: Invalid password (value not shown), does not match required regex pattern: $re"
+        return 1
     else
         log "ERROR: Invalid $name \"$val\", do not match required regex pattern: $re"
         return 1
     fi
 }
 
-log "Parsing user data: \"$1\""
+# j3k0 fork: log the user name only; the user string contains the password (WPH-45)
+log "Parsing user data for user: \"${1%%:*}\""
 IFS=':' read -ra args <<< "$1"
 
 skipIndex=0
-chpasswdOptions=""
+# j3k0 fork: hash plaintext passwords with SHA-512 instead of the PAM default
+# (yescrypt on Debian 12, ~16 MiB per verification: OOM under a 64M limit,
+# WPH-45). chpasswd refuses -c together with -e, so -c is only used for
+# plaintext passwords; pre-hashed (:e) passwords are stored as given.
+chpasswdOptions=(-c SHA512)
 useraddOptions=(--no-user-group --badname)
 
 user="${args[0]}"; validateArg "username" "$user" "$reUser" || exit 1
 pass="${args[1]}"; validateArg "password" "$pass" "$rePass" || exit 1
 
 if [ "${args[2]}" == "e" ]; then
-    chpasswdOptions="-e"
+    chpasswdOptions=(-e)
     skipIndex=1
 fi
 
@@ -102,7 +112,7 @@ fi
 uid="$(id -u "$user")"
 
 if [ -n "$pass" ]; then
-    echo "$user:$pass" | chpasswd $chpasswdOptions
+    echo "$user:$pass" | chpasswd "${chpasswdOptions[@]}"
 else
     usermod -p "*" "$user" # disabled password
 fi
