@@ -10,6 +10,7 @@ USER_=admin PASS=GstYVSjWAwNSsVMwdWFR6SEd
 HELPER=debian:bookworm   # has OpenSSH 9.2: can still generate/scan DSA
 SAFE=$(printf %s "$IMAGE" | tr -c 'A-Za-z0-9._-' '_')
 RES=$BASE/results-$SAFE.txt
+mkdir -p "$BASE"   # must exist before mktemp (first run on a machine)
 WORK=$(mktemp -d "$BASE/work.XXXX")
 NAME=sftp-compat-$$
 HTML=$WORK/html
